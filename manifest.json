@@ -1,0 +1,19 @@
+{
+  "manifest_version": 2,
+  "name": "SF19 Assist (Bot + Puzzle + Live)",
+  "version": "1.1.0",
+  "description": "Stockfish 19 best-move hints for Chess.com bot, puzzle and live games. Highlights the piece to move and its target square in red.",
+  "permissions": ["storage"],
+  "background": {
+    "scripts": ["background.js"],
+    "persistent": true
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.chess.com/*", "https://chess.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "content_security_policy": "script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval'; object-src 'self'"
+}

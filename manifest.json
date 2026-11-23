@@ -1,19 +1,52 @@
 {
-  "manifest_version": 2,
-  "name": "SF19 Assist (Bot + Puzzle + Live)",
-  "version": "1.1.0",
-  "description": "Stockfish 19 best-move hints for Chess.com bot, puzzle and live games. Highlights the piece to move and its target square in red.",
-  "permissions": ["storage"],
+  "manifest_version": 3,
+  "name": "SF19 Assist (Chess.com + Lichess)",
+  "version": "2.6.0",
+  "description": "History-aware Stockfish 19 move hints + ECO opening lookup for Chess.com and Lichess. Manifest V3.",
+  "permissions": [
+    "storage",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "https://www.chess.com/*",
+    "https://chess.com/*",
+    "https://lichess.org/*",
+    "https://*.lichess.org/*"
+  ],
   "background": {
-    "scripts": ["background.js"],
-    "persistent": true
+    "service_worker": "background.js"
   },
   "content_scripts": [
     {
-      "matches": ["https://www.chess.com/*", "https://chess.com/*"],
-      "js": ["content.js"],
+      "matches": [
+        "https://www.chess.com/*",
+        "https://chess.com/*",
+        "https://lichess.org/*",
+        "https://*.lichess.org/*"
+      ],
+      "js": [
+        "chesslib.js",
+        "content.js"
+      ],
       "run_at": "document_idle"
     }
   ],
-  "content_security_policy": "script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval'; object-src 'self'"
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "engine/stockfish-19-lite-single.js",
+        "engine/stockfish-19-lite-single.wasm",
+        "openings.json"
+      ],
+      "matches": [
+        "https://www.chess.com/*",
+        "https://chess.com/*",
+        "https://lichess.org/*",
+        "https://*.lichess.org/*"
+      ]
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  }
 }

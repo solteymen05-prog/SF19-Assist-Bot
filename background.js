@@ -1,147 +1,94 @@
 'use strict';
 
-// ---- Settings -------------------------------------------------------------
-const ENGINE_FILE = 'engine/stockfish-19-lite-single.js'; // .wasm must sit next to it
-const MOVE_TIME_MS = 2000; // search time per position; raise for stronger hints
-const HASH_MB = 32;
+// Thin MV3 service worker. Real Stockfish lives in the offscreen document
+// so the engine survives service-worker suspension and has a proper Worker context.
 
-// ---- State ----------------------------------------------------------------
-let worker = null;
-let ready = false;
-let searching = false;
-let current = null; // request being searched
-let pending = null; // newest request waiting for the engine
-let watchdog = null;
+const OFFSCREEN_URL = 'offscreen.html';
+const OFFSCREEN_REASON = 'WORKERS'; // closest valid reason for long-lived Worker/WASM
 
-function send(cmd) {
-  if (worker) worker.postMessage(cmd);
-}
+let creatingOffscreen = null;
+const ports = new Map(); // id -> port (content script ports)
 
-function reply(req, msg) {
-  if (!req || !req.port) return;
+async function ensureOffscreen() {
+  const existing = await chrome.offscreen.hasDocument().catch(() => false);
+  if (existing) return;
+
+  if (creatingOffscreen) {
+    await creatingOffscreen;
+    return;
+  }
+
+  const reason = (chrome.offscreen.Reason && chrome.offscreen.Reason.WORKERS)
+    || chrome.offscreen.Reason.BLOBS
+    || 'BLOBS';
+
+  creatingOffscreen = chrome.offscreen.createDocument({
+    url: OFFSCREEN_URL,
+    reasons: [reason],
+    justification: 'Host Stockfish WASM worker for chess analysis',
+  });
+
   try {
-    req.port.postMessage(Object.assign({ id: req.id }, msg));
-  } catch (e) {
-    /* port closed */
+    await creatingOffscreen;
+  } finally {
+    creatingOffscreen = null;
   }
 }
 
-function startEngine() {
-  clearTimeout(watchdog);
-  try {
-    if (worker) worker.terminate();
-  } catch (e) {}
-  ready = false;
-  searching = false;
-  try {
-    worker = new Worker(chrome.runtime.getURL(ENGINE_FILE));
-  } catch (e) {
-    reply(current, { type: 'error', message: 'Cannot start engine: ' + e.message });
-    return;
-  }
-  worker.onmessage = (ev) => {
-    const d = ev.data;
-    const line = typeof d === 'string' ? d : d && typeof d.data === 'string' ? d.data : '';
-    if (line) onLine(line);
-  };
-  worker.onerror = () => {
-    ready = false;
-    searching = false;
-    reply(current || pending, {
-      type: 'error',
-      message: 'Engine files missing or blocked. See engine/README.txt',
-    });
-  };
-  send('uci');
-}
-
-function onLine(line) {
-  if (line === 'uciok') {
-    send('setoption name Hash value ' + HASH_MB);
-    send('isready');
-    return;
-  }
-  if (line === 'readyok') {
-    ready = true;
-    if (pending && !searching) {
-      const p = pending;
-      pending = null;
-      run(p);
-    }
-    return;
-  }
-  if (line.startsWith('info ') && line.includes(' pv ') && current) {
-    if (/ (lowerbound|upperbound)/.test(line)) return;
-    const depth = /\bdepth (\d+)/.exec(line);
-    const score = /\bscore (cp|mate) (-?\d+)/.exec(line);
-    const pv = /\bpv (\S+)/.exec(line);
-    if (depth && score && pv) {
-      reply(current, {
-        type: 'info',
-        depth: +depth[1],
-        scoreType: score[1],
-        score: +score[2],
-        move: pv[1],
-      });
-    }
-    return;
-  }
-  if (line.startsWith('bestmove')) {
-    clearTimeout(watchdog);
-    searching = false;
-    const done = current;
-    const m = /^bestmove (\S+)/.exec(line);
-    if (pending) {
-      const p = pending;
-      pending = null;
-      run(p);
-    } else if (done) {
-      reply(done, { type: 'best', move: m ? m[1] : '(none)' });
-    }
-  }
-}
-
-function run(req) {
-  current = req;
-  searching = true;
-  send('position fen ' + req.fen);
-  send('go movetime ' + MOVE_TIME_MS);
-  clearTimeout(watchdog);
-  watchdog = setTimeout(() => {
-    // Engine hung or died (e.g. rejected a position): restart and retry once.
-    if (searching && current === req) {
-      pending = req;
-      startEngine();
-    }
-  }, MOVE_TIME_MS + 6000);
-}
-
-function analyze(req) {
-  if (!worker) startEngine();
-  if (!ready) {
-    pending = req;
-    return;
-  }
-  if (searching) {
-    pending = req;
-    send('stop');
-    return;
-  }
-  run(req);
-}
-
+// Forward messages from content scripts to offscreen, and replies back.
 chrome.runtime.onConnect.addListener((port) => {
-  port.onMessage.addListener((msg) => {
-    if (msg && msg.type === 'analyze' && typeof msg.fen === 'string') {
-      analyze({ id: msg.id, fen: msg.fen, port });
-    } else if (msg && msg.type === 'stop') {
-      pending = null;
-      if (searching) send('stop');
+  if (port.name !== 'sf19') return;
+
+  const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  ports.set(id, port);
+
+  port.onMessage.addListener(async (msg) => {
+    try {
+      await ensureOffscreen();
+      // Tag with our internal port id so offscreen can route the reply
+      chrome.runtime.sendMessage({
+        target: 'offscreen',
+        sourcePortId: id,
+        ...msg,
+      });
+    } catch (e) {
+      try {
+        port.postMessage({ type: 'error', message: 'Offscreen/engine failed: ' + e.message });
+      } catch (_) {}
     }
   });
+
   port.onDisconnect.addListener(() => {
-    if (pending && pending.port === port) pending = null;
+    ports.delete(id);
+    // Tell offscreen to drop any pending work for this port
+    chrome.runtime.sendMessage({
+      target: 'offscreen',
+      type: 'port-closed',
+      sourcePortId: id,
+    }).catch(() => {});
   });
 });
 
-startEngine();
+// Replies coming back from offscreen
+chrome.runtime.onMessage.addListener((msg, sender) => {
+  if (!msg || msg.target !== 'background') return;
+
+  const port = ports.get(msg.sourcePortId);
+  if (!port) return;
+
+  try {
+    const { target, sourcePortId, ...payload } = msg;
+    port.postMessage(payload);
+  } catch (_) {
+    // port already closed
+  }
+});
+
+// Keep offscreen alive when possible (best-effort)
+chrome.runtime.onStartup.addListener(() => {
+  ensureOffscreen().catch(() => {});
+});
+
+chrome.runtime.onInstalled.addListener(() => {
+  ensureOffscreen().catch(() => {});
+});
